@@ -37,6 +37,18 @@ async function gh(path, options = {}) {
   return data;
 }
 
+async function assertOwnerMatchesToken(owner) {
+  const me = await gh("/user");
+  if (me.login.toLowerCase() !== owner.toLowerCase()) {
+    throw new Error(
+      `Refusing to proceed: GITHUB_TOKEN authenticates as '${me.login}', but GITHUB_OWNER ` +
+        `is set to '${owner}'. This mismatch would create/push content under the wrong ` +
+        `account. Either set GITHUB_OWNER to '${me.login}', or generate a new token whose ` +
+        `resource owner is '${owner}'.`
+    );
+  }
+}
+
 function getServer() {
   const server = new McpServer({
     name: "github-repo-assistant",
@@ -176,6 +188,97 @@ function getServer() {
           {
             type: "text",
             text: `Pushed ${files.length} file(s) to ${owner}/${repo}@${branch}.\nView: ${repoInfo.html_url}/tree/${branch}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.tool(
+    "read_file",
+    "Read the contents of a single file from a GitHub repo.",
+    {
+      repo: z.string().describe("Repository name (owner comes from server config)"),
+      path: z.string().describe("File path within the repo, e.g. 'src/index.js'"),
+      branch: z
+        .string()
+        .optional()
+        .default("main")
+        .describe("Branch to read from (default: main)"),
+    },
+    async ({ repo, path, branch }) => {
+      const owner = process.env.GITHUB_OWNER;
+
+      const data = await gh(
+        `/repos/${owner}/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`
+      );
+
+      if (Array.isArray(data)) {
+        throw new Error(
+          `'${path}' is a directory, not a file. Use list_directory instead.`
+        );
+      }
+
+      if (data.type !== "file") {
+        throw new Error(`'${path}' is not a regular file (type: ${data.type}).`);
+      }
+
+      if (data.size > 1_000_000) {
+        throw new Error(
+          `'${path}' is ${data.size} bytes, which exceeds the 1MB limit the Contents API ` +
+            `supports for inline reads.`
+        );
+      }
+
+      const decoded = Buffer.from(data.content, data.encoding || "base64").toString("utf-8");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: decoded,
+          },
+        ],
+      };
+    }
+  );
+
+  server.tool(
+    "list_directory",
+    "List files and subdirectories at a given path in a GitHub repo (defaults to repo root).",
+    {
+      repo: z.string().describe("Repository name (owner comes from server config)"),
+      path: z
+        .string()
+        .optional()
+        .default("")
+        .describe("Directory path within the repo (empty string for repo root)"),
+      branch: z
+        .string()
+        .optional()
+        .default("main")
+        .describe("Branch to list from (default: main)"),
+    },
+    async ({ repo, path, branch }) => {
+      const owner = process.env.GITHUB_OWNER;
+
+      const data = await gh(
+        `/repos/${owner}/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`
+      );
+
+      if (!Array.isArray(data)) {
+        throw new Error(`'${path || "/"}' is a file, not a directory. Use read_file instead.`);
+      }
+
+      const listing = data
+        .map((item) => `${item.type === "dir" ? "[dir]  " : "[file] "}${item.path}`)
+        .join("\n");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: listing || "(empty directory)",
           },
         ],
       };
