@@ -49,10 +49,20 @@ async function assertOwnerMatchesToken(owner) {
   }
 }
 
+/** Resolves a branch ref, returning null on 404 rather than throwing. */
+async function tryGetRef(owner, repo, branch) {
+  try {
+    return await gh(`/repos/${owner}/${repo}/git/ref/heads/${branch}`);
+  } catch (err) {
+    if (err.status !== 404) throw err;
+    return null;
+  }
+}
+
 function getServer() {
   const server = new McpServer({
     name: "github-repo-assistant",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.tool(
@@ -107,9 +117,68 @@ function getServer() {
   );
 
   server.tool(
+    "create_branch",
+    "Create a real branch from an existing base branch, so it starts with the full repo " +
+      "history and file tree. Use this before pushing review branches. If the branch " +
+      "already exists this reports its current SHA instead of erroring.",
+    {
+      repo: z.string().describe("Repository name (owner comes from server config)"),
+      branch: z.string().describe("New branch name, e.g. 'feat/my-change'"),
+      from: z
+        .string()
+        .optional()
+        .describe("Base branch to branch from (default: the repo's default branch)"),
+    },
+    async ({ repo, branch, from }) => {
+      const owner = process.env.GITHUB_OWNER;
+
+      const existing = await tryGetRef(owner, repo, branch);
+      if (existing) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Branch '${branch}' already exists at ${existing.object.sha.slice(0, 7)}. Nothing to do.`,
+            },
+          ],
+        };
+      }
+
+      const repoInfo = await gh(`/repos/${owner}/${repo}`);
+      const base = from || repoInfo.default_branch;
+
+      const baseRef = await tryGetRef(owner, repo, base);
+      if (!baseRef) {
+        throw new Error(
+          `Base branch '${base}' does not exist in ${owner}/${repo}, so there is nothing ` +
+            `to branch from. Check the name, or push an initial commit first.`
+        );
+      }
+
+      await gh(`/repos/${owner}/${repo}/git/refs`, {
+        method: "POST",
+        body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseRef.object.sha }),
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Created branch '${branch}' from '${base}' at ${baseRef.object.sha.slice(0, 7)}.\n` +
+              `View: ${repoInfo.html_url}/tree/${branch}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.tool(
     "push_files",
     "Create or update one or more files in a GitHub repo in a single commit. " +
-      "Creates the branch if it doesn't exist yet (e.g. for a brand new empty repo).",
+      "If the target branch doesn't exist, it is branched off base_branch (or the repo's " +
+      "default branch) so it keeps the full history and file tree. Only a genuinely empty " +
+      "repo produces a root commit.",
     {
       repo: z.string().describe("Repository name (owner comes from server config)"),
       branch: z
@@ -117,6 +186,13 @@ function getServer() {
         .optional()
         .default("main")
         .describe("Branch to push to (default: main)"),
+      base_branch: z
+        .string()
+        .optional()
+        .describe(
+          "Only used when `branch` doesn't exist yet: which branch to create it from. " +
+            "Defaults to the repo's default branch."
+        ),
       commit_message: z.string().describe("Commit message for this push"),
       files: z
         .array(
@@ -128,21 +204,40 @@ function getServer() {
         .min(1)
         .describe("Files to create or update in this commit"),
     },
-    async ({ repo, branch, commit_message, files }) => {
+    async ({ repo, branch, base_branch, commit_message, files }) => {
       const owner = process.env.GITHUB_OWNER;
 
-      let ref = null;
-      try {
-        ref = await gh(`/repos/${owner}/${repo}/git/ref/heads/${branch}`);
-      } catch (err) {
-        if (err.status !== 404) throw err;
-      }
+      const ref = await tryGetRef(owner, repo, branch);
 
-      let baseTreeSha;
       let parentSha;
+      let branchedFrom = null;
 
       if (ref) {
         parentSha = ref.object.sha;
+      } else {
+        // The branch is new. Previously this fell through with no parent and no
+        // base_tree, producing an ORPHAN branch containing only the pushed files --
+        // which then fails to build, since everything else in the repo is missing.
+        // Inherit from a base branch instead, and only allow a root commit when the
+        // repo genuinely has no commits at all.
+        const repoInfo = await gh(`/repos/${owner}/${repo}`);
+        const base = base_branch || repoInfo.default_branch;
+        const baseRef = await tryGetRef(owner, repo, base);
+
+        if (baseRef) {
+          parentSha = baseRef.object.sha;
+          branchedFrom = base;
+        } else if (base_branch) {
+          throw new Error(
+            `base_branch '${base_branch}' does not exist in ${owner}/${repo}. Refusing to ` +
+              `create an orphan branch, which would drop every other file in the repo.`
+          );
+        }
+        // else: no default branch either -> empty repo -> root commit is correct
+      }
+
+      let baseTreeSha;
+      if (parentSha) {
         const baseCommit = await gh(`/repos/${owner}/${repo}/git/commits/${parentSha}`);
         baseTreeSha = baseCommit.tree.sha;
       }
@@ -183,11 +278,20 @@ function getServer() {
 
       const repoInfo = await gh(`/repos/${owner}/${repo}`);
 
+      let note = "";
+      if (branchedFrom) {
+        note = `\nCreated branch '${branch}' from '${branchedFrom}'.`;
+      } else if (!ref) {
+        note = `\nRepo had no commits, so this is a root commit on '${branch}'.`;
+      }
+
       return {
         content: [
           {
             type: "text",
-            text: `Pushed ${files.length} file(s) to ${owner}/${repo}@${branch}.\nView: ${repoInfo.html_url}/tree/${branch}`,
+            text:
+              `Pushed ${files.length} file(s) to ${owner}/${repo}@${branch}.${note}\n` +
+              `View: ${repoInfo.html_url}/tree/${branch}`,
           },
         ],
       };
